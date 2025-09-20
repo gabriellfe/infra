@@ -13,6 +13,11 @@ variable "node_group_size" {
   default = 3
 }
 
+variable "node_group_name" {
+  type    = string
+  default = "eks-node-group"
+}
+
 variable "Environment" {
   type    = string
   default = "Development"

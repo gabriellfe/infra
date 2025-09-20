@@ -27,5 +27,5 @@ module "rabbit" {
 
     # S3 Backup Configuration
   rabbitmq_backup_bucket = "rabbitmq-backup-bucket"
-  create_backup_bucket   = true
+  create_backup_bucket   = false
 }
