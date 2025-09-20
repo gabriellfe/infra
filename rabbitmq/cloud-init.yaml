@@ -1,0 +1,256 @@
+#cloud-config
+write_files:
+  - path: /root/conf/enabled_pluins
+    content: g|
+        [rabbitmq_management].
+  - path: /root/remove_inactive_nodes.sh
+    permissions: '0755'
+    content: |
+        #!/bin/bash
+        CLUSTER_NAME_TAG="rabbitmq-main"
+        REGION="us-east-1"  # ajuste conforme necessário
+
+        NODES=$(rabbitmqctl cluster_status --formatter json | jq -r '.disk_nodes[]')
+        RUNNING=$(rabbitmqctl cluster_status --formatter json | jq -r '.running_nodes[]')
+
+        for NODE in $NODES; do
+          if ! echo "$RUNNING" | grep -q "$NODE"; then
+            NODE_HOST=$(echo $NODE | cut -d@ -f2)
+            INSTANCE_EXISTS=$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=rabbitmq-main" \
+                        "Name=private-dns-name,Values=$NODE_HOST" \
+                        "Name=instance-state-name,Values=running" \
+              --query 'Reservations[*].Instances[*].InstanceId' \
+              --output text)
+
+            if [ -z "$INSTANCE_EXISTS" ]; then
+              echo "[ACTION] Removendo nó morto: $NODE"
+              rabbitmqctl forget_cluster_node "$NODE"
+            fi
+          fi
+        done
+  - path: /etc/cron.d/remove_dead_nodes
+    permissions: '0644'
+    content: |
+        */2 * * * * root /root/remove_inactive_nodes.sh >> /var/log/remove_nodes.log 2>&1
+  - path: /etc/cron.d/export_rabbitmq_definitions
+    permissions: '0644'
+    content: |
+        */15 * * * * root /root/export_definitions.sh >> /var/log/export_definitions.log 2>&1
+  - path: /root/conf/rabbitmq.config
+    content: |
+        [ { rabbit, [
+          { loopback_users, [ ] } ] }
+         ].
+  - path: /root/export_definitions.sh
+    permissions: '0755'
+    content: |
+        #!/bin/bash
+        # Export RabbitMQ definitions to S3
+        BUCKET_NAME="${rabbitmq_backup_bucket}"
+        REGION="us-east-1"
+        HOSTNAME=$(curl -s http://169.254.169.254/latest/meta-data/hostname)
+        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+        
+        # Wait for RabbitMQ to be ready
+        until rabbitmqctl status >/dev/null 2>&1; do
+            echo "Waiting for RabbitMQ to be ready..."
+            sleep 5
+        done
+        
+        # Export definitions using management API
+        DEFINITIONS_FILE="/tmp/rabbitmq_definitions_$TIMESTAMP.json"
+        curl -u admin:admin -H "content-type:application/json" \
+            http://localhost:15672/api/definitions \
+            -o "$DEFINITIONS_FILE"
+        
+        if [ -f "$DEFINITIONS_FILE" ] && [ -s "$DEFINITIONS_FILE" ]; then
+            # Upload to S3 with timestamp
+            aws s3 cp "$DEFINITIONS_FILE" "s3://$BUCKET_NAME/definitions/rabbitmq_definitions_$TIMESTAMP.json" --region "$REGION"
+            
+            # Upload as latest (overwrite)
+            aws s3 cp "$DEFINITIONS_FILE" "s3://$BUCKET_NAME/definitions/rabbitmq_definitions_latest.json" --region "$REGION"
+            
+            # Cleanup local file
+            rm -f "$DEFINITIONS_FILE"
+            
+            echo "[$(date)] Successfully exported definitions to S3"
+        else
+            echo "[$(date)] Failed to export definitions - file empty or missing"
+        fi
+  - path: /root/import_definitions.sh
+    permissions: '0755'
+    content: |
+        #!/bin/bash
+        # Import RabbitMQ definitions from S3
+        BUCKET_NAME="${rabbitmq_backup_bucket}"
+        REGION="us-east-1"
+        DEFINITIONS_FILE="/tmp/rabbitmq_definitions_import.json"
+        
+        echo "[$(date)] Starting definitions import from S3..."
+        
+        # Download latest definitions from S3
+        if aws s3 cp "s3://$BUCKET_NAME/definitions/rabbitmq_definitions_latest.json" "$DEFINITIONS_FILE" --region "$REGION" 2>/dev/null; then
+            echo "[$(date)] Downloaded definitions from S3"
+            
+            # Wait for RabbitMQ management API to be ready
+            echo "[$(date)] Waiting for RabbitMQ management API..."
+            for i in {1..30}; do
+                if curl -u admin:admin -f http://localhost:15672/api/overview >/dev/null 2>&1; then
+                    echo "[$(date)] Management API is ready"
+                    break
+                fi
+                echo "[$(date)] Attempt $i/30 - Management API not ready, waiting..."
+                sleep 10
+            done
+            
+            # Import definitions
+            if curl -u admin:admin -H "content-type:application/json" \
+                -X POST -d @"$DEFINITIONS_FILE" \
+                http://localhost:15672/api/definitions; then
+                echo "[$(date)] Successfully imported definitions from S3"
+            else
+                echo "[$(date)] Failed to import definitions via API"
+            fi
+            
+            # Cleanup
+            rm -f "$DEFINITIONS_FILE"
+        else
+            echo "[$(date)] No definitions found in S3 or failed to download - skipping import"
+        fi
+  - path: /root/remove_inactive_nodes.sh
+    content: |
+        #!/bin/bash
+        CLUSTER_NAME_TAG="rabbitmq-main"
+        REGION="us-east-1"  # ajuste conforme sua região
+        
+        # Obtem todos os nós conhecidos do cluster
+        NODES=$(rabbitmqctl cluster_status --formatter json | jq -r '.disk_nodes[]')
+        
+        # Obtem todos os nós rodando
+        RUNNING=$(rabbitmqctl cluster_status --formatter json | jq -r '.running_nodes[]')
+        
+        echo "[INFO] Nós conhecidos: $NODES"
+        echo "[INFO] Nós ativos: $RUNNING"
+        
+        for NODE in $NODES; do
+          # Se não está na lista de nós ativos
+          if ! echo "$RUNNING" | grep -q "$NODE"; then
+            echo "[WARN] Verificando nó inativo: $NODE"
+        
+            # Extrai o hostname da notação rabbit@ip-10-0-0-1
+            NODE_HOST=$(echo $NODE | cut -d@ -f2)
+        
+            # Verifica se ainda existe alguma instância com esse nome
+            INSTANCE_EXISTS=$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=rabbitmq-main" \
+                        "Name=private-dns-name,Values=$NODE_HOST" \
+                        "Name=instance-state-name,Values=running" \
+              --query 'Reservations[*].Instances[*].InstanceId' \
+              --output text)
+        
+            if [ -z "$INSTANCE_EXISTS" ]; then
+              echo "[ACTION] Removendo nó morto: $NODE"
+              rabbitmqctl forget_cluster_node "$NODE"
+            else
+              echo "[SKIP] Nó $NODE ainda existe na AWS, pulando..."
+            fi
+          fi
+        done
+  - path: /root/bin/join_cluster.sh
+    content: |
+        #!/usr/bin/env sh
+        if ! command -v aws &> /dev/null; then
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          ./aws/install
+        fi
+        OWNWERIP= $(curl -s http://169.254.169.254/latest/meta-data/hostname)
+        DNSES=$(aws ec2 describe-instances \
+          --filters "Name=tag:Name,Values=rabbitmq-main" \
+              "Name=instance-state-name,Values=running" \
+          --query 'Reservations[*].Instances[*].PrivateDnsName' \
+          --output text | grep -v "$HOSTNAME")
+        HOSTNAMES=()
+        OWNWERIP=($${OWNWERIP//./ })
+        for dns in $DNSES; do
+            hostname=($${dns//./ })
+            if [ "$hostname" != "$OWNWERIP" ]; then
+              HOSTNAMES+=( $hostname )
+            fi
+        done
+        echo "Encontrados os seguintes nós: $HOSTNAMES[@]"
+        for run in {1..3}; do
+          sleep $[ ( $RANDOM % 30 )  + 1 ]s
+          rabbitmqctl stop_app
+
+          NEW_HOSTNAMES=()
+          for hostname in $${HOSTNAMES[@]}; do
+            for i in {1..5}; do
+              rabbitmqctl join_cluster rabbit@$hostname
+              st=$?
+              if [ $st -ne 0 ] && [ $st -ne 130 ]; then  # 130 is "already joined"
+                NEW_HOSTNAMES+=( $hostname )
+                break
+              fi
+              if [ $st -eq 0 ]; then
+                echo "Clusterizado $hostname"
+                break
+              fi
+              if [ $st -eq 130 ]; then
+                echo "Ja está no cluster $hostname, continuando..."
+                break
+              fi
+              echo "Tentativa $i falhou, aguardando e tentando novamente..."
+            done
+          done
+
+          HOSTNAMES=( $${NEW_HOSTNAMES[@]} )
+          rabbitmqctl start_app
+
+          if [ $${#HOSTNAMES[@]} -eq 0 ]; then
+            break
+          fi
+        done
+        rabbitmqctl add_user admin admin
+        rabbitmqctl set_user_tags admin administrator
+        rabbitmqctl add_user rabbit ${rabbit_password}
+        rabbitmqctl set_user_tags rabbit management
+        rabbitmqctl add_vhost /
+        rabbitmqctl set_policy -p / ha-three "^" '{"ha-mode":"exactly", "ha-params":${sync_node_count}, "ha-sync-mode":"automatic", "message-ttl":${message_timeout}, "expires":${message_timeout}}'
+        rabbitmqctl set_permissions -p / admin ".*" ".*" ".*"
+        rabbitmqctl set_permissions -p / rabbit ".*" ".*" ".*"
+        rabbitmqctl delete_user guest
+  - path: /root/configure.sh
+    content: |
+        #!/usr/bin/env bash
+  - path: /root/config.sh
+    content: |
+        #!/usr/bin/env bash
+        COOKIE_VALUE="RABBIT_CLUSTER_SECRET_123456"
+        echo "$COOKIE_VALUE" > /var/lib/rabbitmq/.erlang.cookie
+        chown rabbitmq:rabbitmq /var/lib/rabbitmq/.erlang.cookie
+        chmod 400 /var/lib/rabbitmq/.erlang.cookie
+
+        # Configuração básica do rabbitmq.conf
+        cat <<EOF > /etc/rabbitmq/rabbitmq.conf
+        loopback_users.guest = false
+        cluster_partition_handling = autoheal
+        management.tcp.port = 15672
+        EOF
+
+runcmd:
+  - apt-get update
+  - apt-get install -y rabbitmq-server curl unzip jq
+  - rabbitmq-plugins enable rabbitmq_management
+  - bash /root/config.sh
+  - systemctl enable rabbitmq-server
+  - systemctl restart rabbitmq-server
+  - sleep 30
+  - bash /root/bin/join_cluster.sh
+  - chmod +x /root/remove_inactive_nodes.sh
+  - chmod +x /root/export_definitions.sh
+  - chmod +x /root/import_definitions.sh
+  - sleep 60
+  - bash /root/import_definitions.sh
+  - service cron restart
